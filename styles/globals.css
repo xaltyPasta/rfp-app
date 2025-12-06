@@ -1,0 +1,16 @@
+/* styles/globals.css - minimal base styles */
+:root {
+    --bs-body-font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+}
+
+html,
+body,
+#__next {
+    height: 100%;
+    margin: 0;
+    font-family: var(--bs-body-font-family);
+}
+
+a {
+    text-decoration: none;
+}
