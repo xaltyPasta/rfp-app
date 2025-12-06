@@ -337,3 +337,236 @@ Procurement Team`,
     };
   }
 }
+
+
+/* -------------------------------------------------------------------------- */
+/*        NEW: Compare proposals and produce ranking using Groq               */
+/* -------------------------------------------------------------------------- */
+
+export type ProposalForAi = {
+  proposalId: string;
+  vendorName: string | null;
+  totalPrice: number | null;
+  currency: string | null;
+  completeness: number | null;
+  parsed: ParsedProposal | any; // structured proposal JSON you already store
+};
+
+export type AiComparisonItem = {
+  proposalId: string;
+  score: number; // 0–100, higher is better
+  rank: number;  // 1 = best
+  explanation?: any;
+};
+
+export type AiComparisonResult = AiComparisonItem[];
+
+/**
+ * Fallback deterministic ranking if Groq output is invalid.
+ * Heuristic: lower totalPrice is better; tie-breaker = higher completeness.
+ */
+function fallbackRank(proposals: ProposalForAi[]): AiComparisonResult {
+  const sorted = [...proposals].sort((a, b) => {
+    const priceA = a.totalPrice ?? Number.POSITIVE_INFINITY;
+    const priceB = b.totalPrice ?? Number.POSITIVE_INFINITY;
+
+    if (priceA !== priceB) return priceA - priceB;
+
+    const compA = a.completeness ?? 0;
+    const compB = b.completeness ?? 0;
+    return compB - compA;
+  });
+
+  return sorted.map((proposal, index) => ({
+    proposalId: proposal.proposalId,
+    score: Math.max(0, 100 - index * 5),
+    rank: index + 1,
+    explanation: {
+      source: "fallback",
+      reason:
+        "Ranked primarily by lowest totalPrice, with completeness as tie-breaker.",
+      totalPrice: proposal.totalPrice,
+      currency: proposal.currency,
+      completeness: proposal.completeness,
+    },
+  }));
+}
+
+/**
+ * Normalize/validate AI output:
+ * - Filter unknown proposalIds
+ * - Ensure every proposal appears at least once
+ * - Recompute ranks from score desc, starting at 1
+ */
+function normalizeAiResult(
+  proposals: ProposalForAi[],
+  rawItems: Partial<AiComparisonItem>[]
+): AiComparisonResult {
+  const proposalIds = new Set(proposals.map((p) => p.proposalId));
+  const items: AiComparisonItem[] = [];
+
+  for (const raw of rawItems) {
+    if (!raw || !raw.proposalId) continue;
+    if (!proposalIds.has(raw.proposalId)) continue;
+
+    const safeScore = Number.isFinite(raw.score as number)
+      ? Number(raw.score)
+      : 0;
+
+    items.push({
+      proposalId: raw.proposalId,
+      score: Math.min(100, Math.max(0, safeScore)),
+      rank: 0, // temporary, recomputed below
+      explanation: raw.explanation ?? null,
+    });
+  }
+
+  if (items.length === 0) {
+    return fallbackRank(proposals);
+  }
+
+  // Ensure all proposals appear at least once
+  const existing = new Set(items.map((i) => i.proposalId));
+  const missing = proposals.filter((p) => !existing.has(p.proposalId));
+
+  if (missing.length > 0) {
+    const fallbackForMissing = fallbackRank(missing);
+    items.push(...fallbackForMissing);
+  }
+
+  // Recompute ranks from score desc, deterministic
+  const sorted = [...items].sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.proposalId.localeCompare(b.proposalId);
+  });
+
+  return sorted.map((item, index) => ({
+    ...item,
+    rank: index + 1,
+  }));
+}
+
+/**
+ * Main entry: use Groq (llama-3.3-70b) to compare proposals and generate
+ * scores + ranks based on:
+ * - price (totalPrice, currency)
+ * - completeness
+ * - parsed structured data (paymentTerms, deliveryDays, warrantyYears, items, notes)
+ * - RFP structured JSON (from Rfp.structured) if you pass it in context
+ */
+export async function compareProposalsWithAi(
+  proposals: ProposalForAi[],
+  context: {
+    rfpId: string;
+    rfpTitle?: string;
+    rfpDescription?: string | null;
+    rfpStructured?: any | null;
+    evaluationCriteria?: string | null;
+  }
+): Promise<AiComparisonResult> {
+  if (proposals.length === 0) return [];
+
+  const aiInput = proposals.map((p) => ({
+    proposalId: p.proposalId,
+    vendorName: p.vendorName,
+    totalPrice: p.totalPrice,
+    currency: p.currency,
+    completeness: p.completeness,
+    parsed: p.parsed,
+  }));
+
+  const systemPrompt = `
+You are an expert procurement analyst evaluating vendor proposals for an RFP.
+
+You MUST follow these rules:
+
+1. Output ONLY a valid JSON object, no markdown, no extra text.
+2. The JSON MUST have this exact shape:
+
+{
+  "items": [
+    {
+      "proposalId": "string",
+      "score": number,
+      "rank": number,
+      "explanation": {
+        "shortReason": "string",
+        "priceComment": "string",
+        "strengths": string[],
+        "weaknesses": string[],
+        "notes": "string"
+      }
+    },
+    ...
+  ]
+}
+
+3. Every "proposalId" from the input MUST appear exactly once in "items".
+4. "score" should be 0–100 (higher is better).
+5. "rank" must be unique and start at 1, with 1 as the best proposal.
+6. Use ALL available information:
+   - parsed proposal JSON (totalPrice, paymentTerms, deliveryDays, warrantyYears, items, notes)
+   - completeness
+   - cost (totalPrice, currency)
+   - RFP structured JSON (requirements, items, constraints) if provided.
+7. Prefer proposals that best match the RFP requirements overall:
+   - requirement coverage & quality
+   - delivery timeline fit
+   - warranty/support
+   - payment terms
+   - total cost/value
+`.trim();
+
+  const userPrompt = {
+    rfpContext: {
+      rfpId: context.rfpId,
+      title: context.rfpTitle ?? null,
+      description: context.rfpDescription ?? null,
+      structured: context.rfpStructured ?? null,
+      evaluationCriteria:
+        context.evaluationCriteria ??
+        "Choose the overall best value: requirement coverage, quality, delivery timeline, and cost.",
+    },
+    proposals: aiInput,
+  };
+
+  let rawContent: string | undefined;
+
+  try {
+    const completion = await client.chat.completions.create({
+      model: MODEL,
+      temperature: 0.2,
+      messages: [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: JSON.stringify(userPrompt, null, 2),
+        },
+      ],
+    });
+
+    rawContent = completion.choices[0]?.message?.content ?? "";
+    const jsonText = extractJson(rawContent);
+
+    const parsed = JSON.parse(jsonText) as {
+      items?: Partial<AiComparisonItem>[];
+    };
+
+    if (!parsed || !Array.isArray(parsed.items)) {
+      console.warn(
+        "[compareProposalsWithAi] Groq returned invalid shape, using fallback.",
+        jsonText.slice(0, 300)
+      );
+      return fallbackRank(proposals);
+    }
+
+    return normalizeAiResult(proposals, parsed.items);
+  } catch (err) {
+    console.error(
+      "[compareProposalsWithAi] Groq error, using fallback.",
+      err,
+      rawContent?.slice(0, 300)
+    );
+    return fallbackRank(proposals);
+  }
+}
