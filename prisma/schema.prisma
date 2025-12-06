@@ -1,0 +1,203 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-1.1.x"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum Role {
+  BUYER
+  VENDOR
+  ADMIN
+}
+
+enum RfpStatus {
+  DRAFT
+  OPEN
+  CLOSED
+  CANCELLED
+}
+
+enum ProposalStatus {
+  RAW
+  PARSED
+  NEEDS_REVIEW
+  ACCEPTED
+  REJECTED
+}
+
+model User {
+  id            String    @id @default(uuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+  role          Role      @default(BUYER)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // NextAuth relations
+  accounts Account[]
+  sessions Session[]
+
+  // Domain relations
+  rfpsCreated Rfp[]      @relation("rfpCreatedBy")
+  proposals   Proposal[] @relation("userProposals")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+/**
+ * Core domain models
+ */
+
+model Rfp {
+  id          String       @id @default(uuid())
+  title       String
+  description String?
+  structured  Json? // validated JSON produced by LLM (matches rfp schema)
+  attachments Attachment[]
+  status      RfpStatus    @default(DRAFT)
+  metadata    Json? // flexible extra fields (deadline, budgets, categories...)
+  createdById String?
+  createdBy   User?        @relation("rfpCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  // relations
+  rfpVendors RfpVendor[]
+  proposals  Proposal[]
+
+  @@index([createdById])
+  @@index([status])
+}
+
+model Vendor {
+  id          String   @id @default(uuid())
+  name        String
+  email       String   @unique
+  contactName String?
+  phone       String?
+  meta        Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  rfpVendors RfpVendor[]
+  proposals  Proposal[]
+
+  @@index([email])
+  @@index([name])
+}
+
+model RfpVendor {
+  id        String    @id @default(uuid())
+  rfpId     String
+  vendorId  String
+  sentAt    DateTime?
+  status    String    @default("SENT") // SENT, FAILED, RESPONDED, REMINDED
+  messageId String? // Resend message id
+  attempts  Int       @default(0)
+  createdAt DateTime  @default(now())
+
+  rfp    Rfp    @relation(fields: [rfpId], references: [id], onDelete: Cascade)
+  vendor Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  @@unique([rfpId, vendorId])
+  @@index([sentAt])
+}
+
+model Proposal {
+  id           String         @id @default(uuid())
+  rfpId        String
+  vendorId     String?
+  createdById  String? // user who created/ingested this proposal (optional)
+  rawEmail     Json // raw inbound webhook payload (headers, body, attachments metadata)
+  parsed       Json? // parsed JSON from LLM (total_price, line_items, etc.)
+  completeness Float? // 0..1 score
+  currency     String?
+  totalPrice   Decimal?
+  status       ProposalStatus @default(RAW)
+  needsReview  Boolean        @default(false)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  rfp       Rfp     @relation(fields: [rfpId], references: [id], onDelete: Cascade)
+  vendor    Vendor? @relation(fields: [vendorId], references: [id], onDelete: SetNull)
+  createdBy User?   @relation("userProposals", fields: [createdById], references: [id], onDelete: SetNull)
+
+  attachments Attachment[]
+
+  @@index([rfpId])
+  @@index([vendorId])
+  @@index([status])
+}
+
+model Attachment {
+  id         String   @id @default(uuid())
+  url        String
+  publicId   String? // Cloudinary public id or supabase key
+  filename   String?
+  mimeType   String?
+  size       Int?
+  uploadedAt DateTime @default(now())
+
+  // Polymorphic relation fields
+  rfpId      String?
+  proposalId String?
+
+  rfp      Rfp?      @relation(fields: [rfpId], references: [id], onDelete: Cascade)
+  proposal Proposal? @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+
+  @@index([rfpId])
+  @@index([proposalId])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  entity    String // e.g., "RFP", "Proposal", "RFP_VENDOR", "USER"
+  entityId  String?
+  action    String // e.g., "CREATE", "UPDATE", "SEND_EMAIL", "PARSE"
+  payload   Json?
+  createdBy String?
+  createdAt DateTime @default(now())
+
+  @@index([entity, entityId])
+}
